@@ -1,23 +1,98 @@
-#!/bin/sh -x
+#!/bin/sh
 
+# use default answers for any configuration
 export DEBIAN_FRONTEND=noninteractive
 
-rm -f /etc/ssh/ssh_host_*
-dpkg-reconfigure openssh-akc-server
+# set some apt options for this procedure
+cat > /etc/apt/apt.conf.d/99koding-release-upgrade <<EOF
+// autoremove suggestions
+APT::AutoRemove::SuggestsImportant "false";
+// purge configuration files
+APT::Get::Purge "true";
+// don't sync on each operation
+DPkg::Options {"--force-unsafe-io";};
+// keep manual list super tight
+#clear APT::Never-MarkAuto-Sections;
+EOF
 
-echo '#clear APT::Never-MarkAuto-Sections;' > /etc/apt/apt.conf.d/80simple
-echo 'APT::AutoRemove::SuggestsImportant "false";' >> /etc/apt/apt.conf.d/80simple
+# some files cause ENOENT or EPERM when you try to make a hardlink of
+# them. (why?) to work around this, let dpkg unlink old files if it
+# fails to back them up. use a custom library to detect failed backup
+# links and unlink instead.
+gcc -shared -fPIC -xc - -ldl -o /usr/lib/libgiveup.so <<EOF
+#define _GNU_SOURCE
 
-apt-mark showmanual | xargs apt-mark auto
-apt-mark manual ldap-auth-client openssh-akc-server python-apt screen sudo ubuntu-minimal ubuntu-standard
-apt-get -y -o Dpkg::Options::=--force-unsafe-io autoremove --purge
+#include <dlfcn.h>
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
 
+static int (*link_impl)(const char *, const char *);
+__attribute__((constructor)) static void init() {
+	link_impl = dlsym(RTLD_NEXT, "link");
+}
+
+int link(const char *oldpath, const char *newpath) {
+	const int ret = link_impl(oldpath, newpath);
+	// pass through if succeeded
+	if (!ret) return ret;
+	// pass through if some other error
+	if (errno != ENOENT && errno != EPERM) return ret;
+	// pass through if it doesn't look like a backup
+	const int oldlen = strlen(oldpath);
+	const int newlen = strlen(newpath);
+	if (newlen != oldlen + 9) return ret;
+	if (strncmp(oldpath, newpath, oldlen)) return ret;
+	if (strcmp(".dpkg-tmp", newpath + oldlen)) return ret;
+	// unlink instead
+	fprintf(stderr, "libgiveup.so: unlinking %s\n", oldpath);
+	return unlink(oldpath);
+}
+EOF
+
+# uninstall most of the bundled software, except:
+# - ldap-auth-client is so that you can log in with your koding account
+# - python-apt is for do-release-upgrade (shouldn't it be a dependency?)
+# - screen is for the web terminal interface
+# - sudo is so that you can do system administration as root
+# - ubuntu-minimal and ubuntu-standard are for
+# even uninstall openssh-akc-server, so that:
+# - openssh-server postrm will work
+# - regenerate host keys (all koding users are given the default keys)
+apt-mark auto $(apt-mark showmanual)
+apt-mark manual ldap-auth-client python-apt screen sudo ubuntu-minimal ubuntu-standard
+apt-get -y autoremove openssh-server
+
+# note: at this point we no longer have gcc, so everything we need
+# better be built already
+
+# reinstall the ssh server before we jump releases, because:
+# - release upgrades will disable waeckerlin's repo
+# - the current version references on ssh-vulnkey, which doesn't ship
+#   in later Ubuntu releases
+apt-get -y install openssh-akc-server
+
+# koding's internal mirror doesn't have later releases, so switch to
+# an external mirror before the upgrade
 sed -i 's/apt-mirror.in.koding.com/us.archive.ubuntu.com/g' /etc/apt/sources.list
 
-rm -f /sbin/agetty /usr/share/man/man8/agetty.8.gz /bin/uncompress /bin/dnsdomainname /bin/domainname /bin/bzip2 /usr/sbin/uuidd
+# raring -> saucy
+LD_PRELOAD=/usr/lib/libgiveup.so do-release-upgrade -f DistUpgradeViewNonInteractive
 
-do-release-upgrade -f DistUpgradeViewNonInteractive
+# do-release-upgrade removes automatically installed packages that you
+# can no longer download. this leaves them in the config-files
+# state. purge them.
+dpkg --purge $(dpkg -l | awk '/^rc / {print $2}')
 
-apt-get -y -o Dpkg::Options::=--force-unsafe-io install curl emacs24-nox git zip
+# saucy -> trusty
+LD_PRELOAD=/usr/lib/libgiveup.so do-release-upgrade -f DistUpgradeViewNonInteractive
 
+# again, purge config files of obsolete packages
+dpkg --purge $(dpkg -l | awk '/^rc / {print $2}')
+
+# clean up our stuff
+rm -f /etc/apt/apt.conf.d/99koding-release-upgrade /usr/lib/libgiveup.so
+
+# commit anything from --force-unsafe-io
 sync
