@@ -11,14 +11,12 @@ APT::AutoRemove::SuggestsImportant "false";
 APT::Get::Purge "true";
 // don't sync on each operation
 DPkg::Options {"--force-unsafe-io";};
+// use current config files
+DPkg::Options {"--force-confold";};
 // keep manual list super tight
 #clear APT::Never-MarkAuto-Sections;
 EOF
 
-# some files cause ENOENT or EPERM when you try to make a hardlink of
-# them. (why?) to work around this, let dpkg unlink old files if it
-# fails to back them up. use a custom library to detect failed backup
-# links and unlink instead.
 gcc -shared -fPIC -xc - -ldl -o /usr/lib/libgiveup.so <<EOF
 #define _GNU_SOURCE
 
@@ -27,6 +25,11 @@ gcc -shared -fPIC -xc - -ldl -o /usr/lib/libgiveup.so <<EOF
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+
+// some files cause ENOENT or EPERM when you try to make a hardlink of
+// them (why?). to work around this, let dpkg unlink old files if it
+// fails to back them up. use a custom library to detect failed backup
+// links and unlink instead.
 
 static int (*link_impl)(const char *, const char *);
 __attribute__((constructor)) static void init() {
@@ -49,7 +52,28 @@ int link(const char *oldpath, const char *newpath) {
 	fprintf(stderr, "libgiveup.so: unlinking %s\n", oldpath);
 	return unlink(oldpath);
 }
+
+// ignoring sync speeds up these big operations, and it's not like
+// people are gonna try to recover from a failure anyway. these shims
+// are based on libeatmydata, but greatly simplified. glibc doesn't
+// clear errno on success, so these shims don't either. neither apt
+// nor dpkg seem to use O_SYNC or O_DSYNC, so `open` is not shimmed.
+
+int fsync(int fd) {
+	return 0;
+}
+
+int fdatasync(int fd) {
+	return 0;
+}
+
+int msync(void *addr, size_t length, int flags) {
+	return 0;
+}
 EOF
+
+# do everything with our shims
+export LD_PRELOAD=/usr/lib/libgiveup.so
 
 # uninstall most of the bundled software, except:
 # - ldap-auth-client is so that you can log in with your koding account
@@ -78,7 +102,7 @@ apt-get -y install openssh-akc-server
 sed -i 's/apt-mirror.in.koding.com/us.archive.ubuntu.com/g' /etc/apt/sources.list
 
 # raring -> saucy
-LD_PRELOAD=/usr/lib/libgiveup.so do-release-upgrade -f DistUpgradeViewNonInteractive
+do-release-upgrade -f DistUpgradeViewNonInteractive
 
 # do-release-upgrade removes automatically installed packages that you
 # can no longer download. this leaves them in the config-files
@@ -86,13 +110,16 @@ LD_PRELOAD=/usr/lib/libgiveup.so do-release-upgrade -f DistUpgradeViewNonInterac
 dpkg --purge $(dpkg -l | awk '/^rc / {print $2}')
 
 # saucy -> trusty
-LD_PRELOAD=/usr/lib/libgiveup.so do-release-upgrade -f DistUpgradeViewNonInteractive
+do-release-upgrade -f DistUpgradeViewNonInteractive
 
 # again, purge config files of obsolete packages
 dpkg --purge $(dpkg -l | awk '/^rc / {print $2}')
 
+# stop using our lib before we delete it
+unset LD_PRELOAD
+
 # clean up our stuff
 rm -f /etc/apt/apt.conf.d/99koding-release-upgrade /usr/lib/libgiveup.so
 
-# commit anything from --force-unsafe-io
+# now that we're done, commit everything all at once
 sync
